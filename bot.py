@@ -8,6 +8,13 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 
+from calendario import (
+    obtener_turnos_usuario, agregar_turno, eliminar_turno,
+    eliminar_todos_turnos, obtener_turnos_proximos, formatear_calendario,
+    validar_hora, validar_dia, DIAS_SEMANA, DIAS_SEMANA_NOMBRE,
+)
+from notificaciones import notificar_accion
+
 # --- Configuración ---
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -34,15 +41,47 @@ usuarios_baneados: set[int] = set()
 MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2"
 HEADERS_MB = {"User-Agent": "TelegramMusicBot/1.0 (bot_telegram)", "Accept": "application/json"}
 
+# --- API del tiempo (Open-Meteo, gratuita, sin API key) ---
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+
+# Mapeo de códigos WMO a emojis/descripciones
+WMO_CODES = {
+    0: ("☀️", "Despejado"),
+    1: ("🌤", "Mayormente despejado"),
+    2: ("⛅", "Parcialmente nublado"),
+    3: ("☁️", "Nublado"),
+    45: ("🌫️", "Niebla"),
+    48: ("🌫️", "Niebla con escarcha"),
+    51: ("🌦", "Llovizna ligera"),
+    53: ("🌦", "Llovizna moderada"),
+    55: ("🌦", "Llovizna intensa"),
+    61: ("🌧", "Lluvia ligera"),
+    63: ("🌧", "Lluvia moderada"),
+    65: ("🌧", "Lluvia intensa"),
+    71: ("❄️", "Nevada ligera"),
+    73: ("❄️", "Nevada moderada"),
+    75: ("❄️", "Nevada intensa"),
+    80: ("🌦", "Chubascos ligeros"),
+    81: ("🌧", "Chubascos moderados"),
+    82: ("🌧", "Chubascos intensos"),
+    95: ("⛈", "Tormenta"),
+    96: ("⛈", "Tormenta con granizo ligero"),
+    99: ("⛈", "Tormenta con granizo"),
+}
+
 # --- Estadísticas ---
 STATS = {
     "inicio": datetime.now(),
     "total": 0,
     "saludos": 0,
     "bandas": 0,
+    "tiempo": 0,
+    "calendario": 0,
     "comandos_start": 0,
     "comandos_stats": 0,
     "usuarios": set(),
+    "notificaciones_enviadas": 0,
 }
 
 # Saludos reconocidos y sus respuestas
@@ -61,12 +100,28 @@ SALUDOS = {
 }
 
 
+# Nombres legibles para las acciones
+ACCIONES_NOMBRE = {
+    "saludos": "Saludo",
+    "bandas": "Búsqueda de banda",
+    "tiempo": "Consulta del tiempo",
+    "calendario": "Calendario laboral",
+    "comandos_start": "Comando /start",
+    "comandos_stats": "Comando /stats",
+}
+
+
 def registrar(tipo: str, update: Update):
-    """Registra una petición en las estadísticas."""
+    """Registra una petición en las estadísticas y notifica por email."""
     STATS["total"] += 1
     STATS[tipo] += 1
     if update.effective_user:
         STATS["usuarios"].add(update.effective_user.id)
+        # Enviar email de notificación (transparente, en background)
+        nombre = update.effective_user.full_name or "Desconocido"
+        user_id = update.effective_user.id
+        accion = ACCIONES_NOMBRE.get(tipo, tipo)
+        asyncio.create_task(notificar_accion(nombre, user_id, accion))
 
 
 def es_admin(user_id: int) -> bool:
@@ -156,10 +211,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📨 Peticiones totales: {STATS['total']}\n\n"
         f"👋 Saludos: {STATS['saludos']}\n"
         f"🎸 Búsquedas de bandas: {STATS['bandas']}\n"
+        f"🌤 Consultas de tiempo: {STATS['tiempo']}\n"
+        f"📅 Calendario: {STATS['calendario']}\n"
         f"▶️ Comandos /start: {STATS['comandos_start']}\n"
         f"📊 Comandos /stats: {STATS['comandos_stats']}\n\n"
         f"👥 Usuarios únicos: {len(STATS['usuarios'])}\n"
         f"🚫 Usuarios baneados: {len(usuarios_baneados)}\n"
+        f"🔔 Notificaciones enviadas: {STATS['notificaciones_enviadas']}\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -268,7 +326,29 @@ def get_main_keyboard():
     keyboard = [
         [
             InlineKeyboardButton("🎸 Buscar banda", callback_data="btn_banda"),
+            InlineKeyboardButton("🌤 Tiempo", callback_data="btn_tiempo"),
+        ],
+        [
+            InlineKeyboardButton("� Calendario", callback_data="btn_calendario"),
             InlineKeyboardButton("📊 Estadísticas", callback_data="btn_stats"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_calendario_keyboard():
+    """Devuelve el teclado del calendario."""
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Añadir turno", callback_data="cal_add"),
+            InlineKeyboardButton("📄 Ver turnos", callback_data="cal_ver"),
+        ],
+        [
+            InlineKeyboardButton("❌ Eliminar turno", callback_data="cal_del"),
+            InlineKeyboardButton("🗑 Borrar todo", callback_data="cal_clear"),
+        ],
+        [
+            InlineKeyboardButton("◀️ Volver", callback_data="btn_volver"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -281,9 +361,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     registrar("comandos_start", update)
     await update.message.reply_text(
         "¡Hola! 👋 Soy un bot multifunción.\n\n"
-        "🎵 Escribe /banda <nombre> para consultar la discografía de un grupo.\n"
-        "📊 Escribe /stats para ver las estadísticas del bot.\n"
-        "👋 O escríbeme un saludo como «hola», «buenos días» o «hey».\n\n"
+        "🎵 /banda <nombre> — Discografía de un grupo\n"
+        "🌤 /tiempo <ciudad> — Tiempo actual y previsión\n"
+        "� /horario — Calendario laboral\n"
+        "�📊 /stats — Estadísticas del bot\n"
+        "👋 O escríbeme un saludo\n\n"
         "También puedes usar los botones de abajo:",
         reply_markup=get_main_keyboard(),
     )
@@ -307,8 +389,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Uptime: {horas}h {minutos}m {segundos}s\n"
             f"📨 Peticiones totales: {STATS['total']}\n\n"
             f"👋 Saludos: {STATS['saludos']}\n"
-            f"🎸 Búsquedas de bandas: {STATS['bandas']}\n"
-            f"▶️ Comandos /start: {STATS['comandos_start']}\n"
+            f"🎸 Búsquedas de bandas: {STATS['bandas']}\n"        f"🌤 Consultas de tiempo: {STATS['tiempo']}\n"
+        f"📅 Calendario: {STATS['calendario']}\n"
+        f"▶️ Comandos /start: {STATS['comandos_start']}\n"
             f"📊 Comandos /stats: {STATS['comandos_stats']}\n\n"
             f"👥 Usuarios únicos: {len(STATS['usuarios'])}\n"
         )
@@ -321,12 +404,348 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="btn_cancelar")]]),
         )
 
+    elif query.data == "btn_tiempo":
+        context.user_data["esperando_ciudad"] = True
+        await query.edit_message_text(
+            "🌤 Escribe el nombre de la ciudad o envía tu ubicación 📍:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="btn_cancelar")]]),
+        )
+
+    elif query.data == "btn_calendario":
+        registrar("calendario", update)
+        await query.edit_message_text(
+            "📅 *Calendario laboral*\n\n"
+            "Gestiona tus turnos de entrada y salida.\n"
+            "Recibirás una notificación 10 minutos antes.",
+            parse_mode="Markdown",
+            reply_markup=get_calendario_keyboard(),
+        )
+
+    elif query.data == "btn_volver":
+        await query.edit_message_text(
+            "Elige una opción:",
+            reply_markup=get_main_keyboard(),
+        )
+
+    elif query.data == "cal_ver":
+        texto = formatear_calendario(update.effective_user.id)
+        await query.edit_message_text(
+            texto,
+            parse_mode="Markdown",
+            reply_markup=get_calendario_keyboard(),
+        )
+
+    elif query.data == "cal_add":
+        context.user_data["cal_paso"] = "dia"
+        dias_btns = [
+            [InlineKeyboardButton(d.capitalize(), callback_data=f"caldia_{d}")]
+            for d in ["lunes", "martes", "mi\u00e9rcoles", "jueves", "viernes", "s\u00e1bado", "domingo"]
+        ]
+        dias_btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="btn_calendario")])
+        await query.edit_message_text(
+            "➕ *A\u00f1adir turno*\n\n"
+            "Selecciona el d\u00eda de la semana:\n\n"
+            "_Tambi\u00e9n puedes escribir una fecha espec\u00edfica (ej: 20/03/2026)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(dias_btns),
+        )
+
+    elif query.data.startswith("caldia_"):
+        dia = query.data.replace("caldia_", "")
+        context.user_data["cal_dia"] = dia
+        context.user_data["cal_paso"] = "hora"
+        await query.edit_message_text(
+            f"➕ D\u00eda: *{dia.capitalize()}*\n\n"
+            "⏰ Escribe la hora (formato HH:MM):\n"
+            "Ejemplo: 08:00, 14:30, 17:00",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="btn_calendario")]]),
+        )
+
+    elif query.data.startswith("caltipo_"):
+        tipo = query.data.replace("caltipo_", "")
+        dia = context.user_data.get("cal_dia", "")
+        hora = context.user_data.get("cal_hora", "")
+        context.user_data["cal_paso"] = None
+
+        ok = agregar_turno(update.effective_user.id, dia, hora, tipo)
+        if ok:
+            emoji = "🟢" if tipo == "entrada" else "🔴"
+            await query.edit_message_text(
+                f"✅ Turno a\u00f1adido:\n\n"
+                f"📆 D\u00eda: {dia.capitalize()}\n"
+                f"⏰ Hora: {hora}\n"
+                f"{emoji} Tipo: {tipo.capitalize()}\n\n"
+                f"_Recibir\u00e1s notificaci\u00f3n a las {hora} (10 min antes)_",
+                parse_mode="Markdown",
+                reply_markup=get_calendario_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                "⚠\ufe0f Ese turno ya existe en tu calendario.",
+                reply_markup=get_calendario_keyboard(),
+            )
+
+    elif query.data == "cal_del":
+        turnos = obtener_turnos_usuario(update.effective_user.id)
+        if not turnos:
+            await query.edit_message_text(
+                "No tienes turnos para eliminar.",
+                reply_markup=get_calendario_keyboard(),
+            )
+        else:
+            btns = []
+            for i, t in enumerate(turnos):
+                emoji = "🟢" if t["tipo"] == "entrada" else "🔴"
+                label = f"{emoji} {t['dia'].capitalize()} {t['hora']} - {t['tipo']}"
+                btns.append([InlineKeyboardButton(label, callback_data=f"caldel_{i}")])
+            btns.append([InlineKeyboardButton("◀\ufe0f Volver", callback_data="btn_calendario")])
+            await query.edit_message_text(
+                "❌ *Eliminar turno*\n\nSelecciona el turno a eliminar:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(btns),
+            )
+
+    elif query.data.startswith("caldel_"):
+        idx = int(query.data.replace("caldel_", ""))
+        turno = eliminar_turno(update.effective_user.id, idx)
+        if turno:
+            await query.edit_message_text(
+                f"✅ Turno eliminado: {turno['dia'].capitalize()} {turno['hora']} ({turno['tipo']})",
+                reply_markup=get_calendario_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                "❌ No se pudo eliminar el turno.",
+                reply_markup=get_calendario_keyboard(),
+            )
+
+    elif query.data == "cal_clear":
+        context.user_data["cal_confirmar_borrado"] = True
+        await query.edit_message_text(
+            "⚠\ufe0f \u00bfEst\u00e1s seguro de que quieres borrar TODOS tus turnos?",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ S\u00ed, borrar todo", callback_data="cal_clear_si"),
+                    InlineKeyboardButton("❌ No", callback_data="btn_calendario"),
+                ]
+            ]),
+        )
+
+    elif query.data == "cal_clear_si":
+        cantidad = eliminar_todos_turnos(update.effective_user.id)
+        await query.edit_message_text(
+            f"🗑 Se eliminaron {cantidad} turnos.",
+            reply_markup=get_calendario_keyboard(),
+        )
+
     elif query.data == "btn_cancelar":
         context.user_data["esperando_banda"] = False
+        context.user_data["esperando_ciudad"] = False
+        context.user_data["cal_paso"] = None
         await query.edit_message_text(
             "👌 Cancelado. Usa los botones o escribe un comando.",
             reply_markup=get_main_keyboard(),
         )
+
+
+# --- Funcionalidad del calendario ---
+
+async def horario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /horario — gestiona tu calendario laboral."""
+    if not await control_acceso(update):
+        return
+    registrar("calendario", update)
+
+    await update.message.reply_text(
+        "📅 *Calendario laboral*\n\n"
+        "Gestiona tus turnos de entrada y salida.\n"
+        "Recibirás una notificación 10 minutos antes.",
+        parse_mode="Markdown",
+        reply_markup=get_calendario_keyboard(),
+    )
+
+
+async def comprobar_notificaciones(context: ContextTypes.DEFAULT_TYPE):
+    """Job que se ejecuta cada minuto para enviar notificaciones."""
+    turnos = obtener_turnos_proximos(minutos_antes=10)
+
+    for turno in turnos:
+        user_id = turno["user_id"]
+        tipo = turno["tipo"]
+        hora = turno["hora"]
+        dia = turno["dia"].capitalize()
+
+        if tipo == "entrada":
+            emoji = "🟢"
+            msg = (
+                f"🔔 *Recordatorio de ENTRADA*\n\n"
+                f"{emoji} Tu turno de *entrada* es a las *{hora}*\n"
+                f"📅 {dia}\n\n"
+                f"⏰ \u00a1Faltan 10 minutos! Prep\u00e1rate."
+            )
+        else:
+            emoji = "🔴"
+            msg = (
+                f"🔔 *Recordatorio de SALIDA*\n\n"
+                f"{emoji} Tu turno de *salida* es a las *{hora}*\n"
+                f"📅 {dia}\n\n"
+                f"⏰ \u00a1Faltan 10 minutos! Ve terminando."
+            )
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=msg,
+                parse_mode="Markdown",
+            )
+            STATS["notificaciones_enviadas"] += 1
+        except Exception as e:
+            print(f"⚠️ Error enviando notificación a {user_id}: {e}")
+
+
+# --- Funcionalidad del tiempo ---
+
+async def obtener_tiempo(lat: float, lon: float) -> dict | None:
+    """Consulta Open-Meteo y devuelve tiempo actual + previsión horaria."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                "hourly": "temperature_2m,weather_code,precipitation_probability",
+                "forecast_hours": 12,
+                "timezone": "auto",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def geocodificar(ciudad: str) -> tuple[float, float, str] | None:
+    """Busca coordenadas de una ciudad. Devuelve (lat, lon, nombre_completo)."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            GEOCODING_URL,
+            params={"name": ciudad, "count": 1, "language": "es"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        resultados = data.get("results", [])
+        if not resultados:
+            return None
+        r = resultados[0]
+        nombre = r.get("name", ciudad)
+        pais = r.get("country", "")
+        admin = r.get("admin1", "")
+        nombre_completo = f"{nombre}, {admin}, {pais}" if admin else f"{nombre}, {pais}"
+        return r["latitude"], r["longitude"], nombre_completo
+
+
+def formatear_tiempo(data: dict, ubicacion: str) -> str:
+    """Formatea la respuesta del tiempo para Telegram."""
+    current = data.get("current", {})
+    hourly = data.get("hourly", {})
+
+    temp = current.get("temperature_2m", "?")
+    sensacion = current.get("apparent_temperature", "?")
+    humedad = current.get("relative_humidity_2m", "?")
+    viento = current.get("wind_speed_10m", "?")
+    code = current.get("weather_code", 0)
+    emoji, desc = WMO_CODES.get(code, ("❓", "Desconocido"))
+
+    lineas = [
+        f"📍 *{ubicacion}*",
+        "",
+        f"{emoji} *{desc}*",
+        f"🌡 Temperatura: *{temp}°C*",
+        f"🥵 Sensación térmica: {sensacion}°C",
+        f"💧 Humedad: {humedad}%",
+        f"💨 Viento: {viento} km/h",
+        "",
+        "🕒 *Previsión próximas horas:*",
+    ]
+
+    tiempos = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    codes = hourly.get("weather_code", [])
+    precip = hourly.get("precipitation_probability", [])
+
+    for i in range(min(12, len(tiempos))):
+        hora = tiempos[i].split("T")[1] if "T" in tiempos[i] else tiempos[i]
+        t = temps[i] if i < len(temps) else "?"
+        c = codes[i] if i < len(codes) else 0
+        p = precip[i] if i < len(precip) else 0
+        e, _ = WMO_CODES.get(c, ("❓", ""))
+        lineas.append(f"  {hora} — {e} {t}°C  🌧{p}%")
+
+    return "\n".join(lineas)
+
+
+async def enviar_tiempo(update_or_query, lat: float, lon: float, ubicacion: str, es_boton: bool = False):
+    """Obtiene y envía el tiempo. Funciona tanto con mensajes como con botones."""
+    try:
+        data = await obtener_tiempo(lat, lon)
+    except Exception as e:
+        msg_err = f"❌ Error al obtener el tiempo: {e}"
+        if es_boton:
+            await update_or_query.message.reply_text(msg_err, reply_markup=get_main_keyboard())
+        else:
+            await update_or_query.reply_text(msg_err)
+        return
+
+    if not data:
+        msg_err = "❌ No se pudo obtener información del tiempo."
+        if es_boton:
+            await update_or_query.message.reply_text(msg_err, reply_markup=get_main_keyboard())
+        else:
+            await update_or_query.reply_text(msg_err)
+        return
+
+    mensaje = formatear_tiempo(data, ubicacion)
+    if es_boton:
+        await update_or_query.message.reply_text(mensaje, parse_mode="Markdown", reply_markup=get_main_keyboard())
+    else:
+        await update_or_query.reply_text(mensaje, parse_mode="Markdown")
+
+
+async def tiempo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /tiempo <ciudad> — consulta el tiempo."""
+    if not await control_acceso(update):
+        return
+    registrar("tiempo", update)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: /tiempo <ciudad>\n"
+            "Ejemplo: /tiempo Madrid\n\n"
+            "También puedes enviar tu ubicación 📍 directamente."
+        )
+        return
+
+    ciudad = " ".join(context.args)
+    await update.message.reply_text(f"🔍 Buscando el tiempo en *{ciudad}*...", parse_mode="Markdown")
+
+    geo = await geocodificar(ciudad)
+    if not geo:
+        await update.message.reply_text(f"❌ No encontré la ciudad \u00ab{ciudad}\u00bb.")
+        return
+
+    lat, lon, nombre = geo
+    await enviar_tiempo(update.message, lat, lon, nombre)
+
+
+async def ubicacion_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja ubicaciones enviadas por el usuario."""
+    if not await control_acceso(update):
+        return
+    registrar("tiempo", update)
+
+    loc = update.message.location
+    await update.message.reply_text("🔍 Consultando el tiempo en tu ubicación...")
+    await enviar_tiempo(update.message, loc.latitude, loc.longitude, "Tu ubicación")
 
 
 # --- Funcionalidad de música ---
@@ -444,6 +863,68 @@ async def responder_saludo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta saludos en el mensaje y responde."""
     if not await control_acceso(update):
         return
+    # Si estamos esperando hora para el calendario
+    if context.user_data.get("cal_paso") == "hora":
+        hora = validar_hora(update.message.text.strip())
+        if not hora:
+            await update.message.reply_text(
+                "❌ Formato inválido. Escribe la hora como HH:MM (ej: 08:00, 14:30)",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="btn_calendario")]]),
+            )
+            return
+
+        context.user_data["cal_hora"] = hora
+        context.user_data["cal_paso"] = "tipo"
+        dia = context.user_data.get("cal_dia", "")
+        await update.message.reply_text(
+            f"➕ Día: *{dia.capitalize()}* | Hora: *{hora}*\n\n"
+            "¿Es una *entrada* o una *salida*?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🟢 Entrada", callback_data="caltipo_entrada"),
+                    InlineKeyboardButton("🔴 Salida", callback_data="caltipo_salida"),
+                ],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="btn_calendario")],
+            ]),
+        )
+        return
+
+    # Si estamos esperando un día escrito (fecha específica)
+    if context.user_data.get("cal_paso") == "dia":
+        dia = validar_dia(update.message.text.strip())
+        if not dia:
+            await update.message.reply_text(
+                "❌ Día no válido. Usa un día de la semana o una fecha (DD/MM/YYYY)",
+            )
+            return
+
+        context.user_data["cal_dia"] = dia
+        context.user_data["cal_paso"] = "hora"
+        await update.message.reply_text(
+            f"➕ Día: *{dia.capitalize()}*\n\n"
+            "⏰ Escribe la hora (formato HH:MM):",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="btn_calendario")]]),
+        )
+        return
+
+    # Si estamos esperando una ciudad desde el botón de tiempo
+    if context.user_data.get("esperando_ciudad"):
+        context.user_data["esperando_ciudad"] = False
+        registrar("tiempo", update)
+        ciudad = update.message.text.strip()
+        await update.message.reply_text(f"🔍 Buscando el tiempo en *{ciudad}*...", parse_mode="Markdown")
+
+        geo = await geocodificar(ciudad)
+        if not geo:
+            await update.message.reply_text(f"❌ No encontré la ciudad \u00ab{ciudad}\u00bb.", reply_markup=get_main_keyboard())
+            return
+
+        lat, lon, nombre = geo
+        await enviar_tiempo(update, lat, lon, nombre, es_boton=True)
+        return
+
     # Si estamos esperando un nombre de banda desde el botón
     if context.user_data.get("esperando_banda"):
         context.user_data["esperando_banda"] = False
@@ -505,11 +986,19 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("banda", banda))
+    app.add_handler(CommandHandler("tiempo", tiempo_cmd))
+    app.add_handler(CommandHandler("horario", horario_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("miid", miid))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.LOCATION, ubicacion_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_saludo))
+
+    # Programar comprobación de notificaciones cada 60 segundos
+    job_queue = app.job_queue
+    job_queue.run_repeating(comprobar_notificaciones, interval=60, first=10)
+    print("📅 Notificaciones de calendario activadas (cada 60s)")
 
     print("🤖 Bot iniciado. Esperando mensajes...")
     loop = asyncio.new_event_loop()

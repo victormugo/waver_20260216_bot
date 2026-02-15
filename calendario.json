@@ -1,0 +1,29 @@
+{
+  "5974701": [
+    {
+      "dia": "lunes",
+      "hora": "08:30",
+      "tipo": "entrada"
+    },
+    {
+      "dia": "lunes",
+      "hora": "14:00",
+      "tipo": "salida"
+    },
+    {
+      "dia": "lunes",
+      "hora": "15:00",
+      "tipo": "entrada"
+    },
+    {
+      "dia": "lunes",
+      "hora": "18:00",
+      "tipo": "salida"
+    },
+    {
+      "dia": "domingo",
+      "hora": "12:00",
+      "tipo": "entrada"
+    }
+  ]
+}

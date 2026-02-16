@@ -44,6 +44,26 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+### 🎯 Scripts de Gestión (Windows)
+
+Para facilitar la gestión del bot, usa estos scripts:
+
+```powershell
+# Iniciar el bot
+.\start.ps1
+
+# Detener el bot
+.\stop.ps1
+
+# Reiniciar el bot (recomendado después de cambios)
+.\restart.ps1
+```
+
+**Nota**: Si tienes problemas de permisos, ejecuta primero:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
 ## 📋 Flujo de Datos
 
 ```
@@ -122,7 +142,12 @@ bot_telegram/
 │   ├── requirements.txt          # Dependencias
 │   └── calendario.json           # Datos persistentes
 │
-├── 🔒 SEGURIDAD Y CONTROL
+├── � SCRIPTS DE GESTIÓN
+│   ├── start.ps1                 # Iniciar bot
+│   ├── stop.ps1                  # Detener bot
+│   └── restart.ps1               # Reiniciar bot
+│
+├── �🔒 SEGURIDAD Y CONTROL
 │   ├── acceso.py                 # Rate limiting, permisos
 │   └── admin.py                  # Comandos administrativos
 │
